@@ -9,6 +9,7 @@ Your tasks include:
 Example:
 Dr. Mensah: Good morning. How are you feeling today?
 Patient [Ama Boakye]: I'm experiencing sharp headaches and nausea.
+- If the input is a single continuous block of text with no explicit speaker labels (e.g. a translated transcript), infer speaker turns from conversational context as best as possible, and note in the report that speaker attribution is inferred rather than explicit.
 
 2. Generate a Consultation Report:
 After the dialogue is reconstructed, generate a well-structured medical report. The report should include:

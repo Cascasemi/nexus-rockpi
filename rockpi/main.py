@@ -1,3 +1,4 @@
+import sys
 import time
 import os
 import threading
@@ -20,6 +21,9 @@ except ImportError:
     gpiod = None  # libgpiod python bindings not installed — button falls back to keyboard trigger
 
 load_dotenv()
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # ============================================================
 # CONFIG

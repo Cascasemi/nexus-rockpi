@@ -3,9 +3,8 @@ import time
 import os
 import threading
 import speech_recognition as sr
-from queue import Queue, Empty
+from queue import Queue
 import pyttsx3
-from vosk import Model, KaldiRecognizer, SetLogLevel
 from google import genai
 from google.genai import types, errors as genai_errors
 from docx import Document
@@ -28,6 +27,11 @@ if hasattr(sys.stdout, "reconfigure"):
 # ============================================================
 # CONFIG
 # ============================================================
+# Experimental variant: sends the raw session audio straight to Gemini
+# (transcription + report + diagnosis all in one call) instead of
+# transcribing locally with Vosk first. Try this if Vosk is struggling
+# with an accent it wasn't trained on.
+
 BUTTON_GPIO_CHIP = "/dev/gpiochip0"   # Rock Pi 4C+ typically exposes gpiochip0-4; verify with `gpiodetect`
 BUTTON_LINE_OFFSET = 17               # Change to match the physical pin you wired the button to
 
@@ -38,14 +42,10 @@ AIRTABLE_ID_FIELD = os.getenv("AIRTABLE_ID_FIELD", "ID")  # name of the column h
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-VOSK_MODEL_PATH = os.getenv(
-    "VOSK_MODEL_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "vosk-model-small-en-us-0.15"),
-)
-SetLogLevel(-1)  # silence Vosk's default debug logging
-
 REPORT_UPLOAD_URL = "https://nexus-medi-backend-gykw.onrender.com/api/v1/reports"
 REPORT_UPLOAD_AUTH = "nexusrobogenn0825"
+
+TWI_BRIDGE_URL = os.getenv("TWI_BRIDGE_URL", "https://twi-bridge.onrender.com/twi-to-english")
 
 # ============================================================
 # TRIGGER SYSTEM: supports BOTH a physical button AND keyboard Enter
@@ -85,19 +85,33 @@ def button_watcher(line, trigger_queue, poll_interval=0.05):
 
 
 def keyboard_watcher(trigger_queue):
-    """Runs forever in a background thread. Puts ('keyboard','press') on the queue on every Enter."""
+    """
+    Runs forever in a background thread. A bare Enter puts ('keyboard','press')
+    on the queue; typing 't' then Enter puts ('keyboard','toggle_language') instead.
+    """
     while True:
         try:
-            input()
-            trigger_queue.put(('keyboard', 'press'))
+            line = input().strip().lower()
         except EOFError:
             return
+        if line == 't':
+            trigger_queue.put(('keyboard', 'toggle_language'))
+        else:
+            trigger_queue.put(('keyboard', 'press'))
 
 
-def wait_for_start_trigger(trigger_queue):
-    """Blocks until either the button is pressed or Enter is hit. Returns the source: 'button' or 'keyboard'."""
+def wait_for_start_trigger(trigger_queue, language_state):
+    """
+    Blocks until either the button is pressed or Enter is hit. Returns the source:
+    'button' or 'keyboard'. Along the way, handles 't' presses that toggle the
+    session language between English and Twi.
+    """
     while True:
         source, action = trigger_queue.get()
+        if action == 'toggle_language':
+            language_state['value'] = 'twi' if language_state['value'] == 'english' else 'english'
+            read_text(f"Language set to {language_state['value'].capitalize()}.")
+            continue
         if action == 'press':
             return source
 
@@ -173,57 +187,40 @@ def find_usb_microphone_index():
 
 
 # ============================================================
-# AUDIO / SPEECH
+# AUDIO RECORDING (no local transcription — raw audio goes to Gemini)
 # ============================================================
-def speech_to_text_continuous(stop_event, mic_index, vosk_model):
-    audio_queue = Queue()
+def record_full_session(stop_event, mic_index):
+    """
+    Records continuously until stop_event is set, and returns the whole
+    session as WAV bytes. No transcription happens locally — Gemini gets
+    the raw audio directly.
+    """
     recognizer = sr.Recognizer()
-    combined_text = []
+    frames = []
 
-    def record_audio():
-        with sr.Microphone(device_index=mic_index) as source:
-            recognizer.adjust_for_ambient_noise(source)
-            print("Recording... (release button to stop)")
+    with sr.Microphone(device_index=mic_index) as source:
+        recognizer.adjust_for_ambient_noise(source)
+        sample_rate = source.SAMPLE_RATE
+        sample_width = source.SAMPLE_WIDTH
+        print("Recording... (release button to stop)")
 
-            while not stop_event.is_set():
-                try:
-                    audio = recognizer.listen(source, timeout=0.1, phrase_time_limit=10)
-                    audio_queue.put(audio)
-                except sr.WaitTimeoutError:
-                    continue
-                except Exception as e:
-                    print(f"Recording error: {e}")
-                    break
-
-    def process_audio():
-        while not stop_event.is_set() or not audio_queue.empty():
+        while not stop_event.is_set():
             try:
-                audio = audio_queue.get(timeout=1)
-                raw_data = audio.get_raw_data(convert_rate=16000, convert_width=2)
-                chunk_recognizer = KaldiRecognizer(vosk_model, 16000)
-                chunk_recognizer.AcceptWaveform(raw_data)
-                result = json.loads(chunk_recognizer.FinalResult())
-                text = result.get("text", "").strip()
-                if text:
-                    combined_text.append(text)
-                    print(f"Partial: {text}")
-            except Empty:
+                audio = recognizer.listen(source, timeout=0.1, phrase_time_limit=10)
+                frames.append(audio.get_raw_data())
+            except sr.WaitTimeoutError:
                 continue
-
-    record_thread = threading.Thread(target=record_audio, daemon=True)
-    process_thread = threading.Thread(target=process_audio, daemon=True)
-
-    record_thread.start()
-    process_thread.start()
-
-    while not stop_event.is_set():
-        time.sleep(0.1)
+            except Exception as e:
+                print(f"Recording error: {e}")
+                break
 
     print("\nStopping recording...")
-    record_thread.join(timeout=2.0)
-    process_thread.join(timeout=2.0)
 
-    return " ".join(combined_text)
+    if not frames:
+        return None
+
+    combined_audio = sr.AudioData(b"".join(frames), sample_rate, sample_width)
+    return combined_audio.get_wav_data()
 
 
 def read_text(text):
@@ -244,9 +241,26 @@ def read_text(text):
 
 
 # ============================================================
-# GEMINI REPORT GENERATION
+# TWI BRIDGE: Twi audio -> Twi text -> English text (via GhanaNLP)
 # ============================================================
-def generate(user_input, chat_history, medical_prompt):
+def transcribe_twi_to_english(wav_bytes):
+    """Sends the session WAV to the Twi bridge service, which returns English text."""
+    response = requests.post(
+        TWI_BRIDGE_URL,
+        files={"audio": ("session.wav", wav_bytes, "audio/wav")},
+        timeout=180,
+    )
+    response.raise_for_status()
+    data = response.json()
+    print(f"Twi transcription: {data['twi_text']}")
+    print(f"English translation: {data['english_text']}")
+    return data["english_text"]
+
+
+# ============================================================
+# GEMINI REPORT GENERATION — from already-transcribed text (used for the Twi path)
+# ============================================================
+def generate_from_text(user_input, chat_history, medical_prompt):
     client = genai.Client(api_key=GEMINI_API_KEY)
     model = "gemini-2.5-flash"
 
@@ -257,13 +271,11 @@ def generate(user_input, chat_history, medical_prompt):
 
     contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_input)]))
 
-    tools = [types.Tool(google_search=types.GoogleSearch())]
     generate_content_config = types.GenerateContentConfig(
         temperature=1,
         top_p=0.95,
         top_k=40,
         max_output_tokens=8192,
-        tools=tools,
         response_mime_type="text/plain",
     )
 
@@ -288,14 +300,67 @@ def generate(user_input, chat_history, medical_prompt):
 
 
 # ============================================================
+# GEMINI REPORT GENERATION — straight from audio (used for the English path)
+# ============================================================
+def generate_from_audio(wav_bytes, chat_history, medical_prompt):
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    model = "gemini-2.5-flash"
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    temp_audio_path = os.path.join(script_dir, f"_session_audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav")
+    with open(temp_audio_path, "wb") as f:
+        f.write(wav_bytes)
+
+    try:
+        audio_file = client.files.upload(file=temp_audio_path)
+
+        contents = [medical_prompt]
+        for message in chat_history:
+            contents.append(f"Previous {message['role']} turn: {message['text']}")
+        contents.append(audio_file)
+
+        generate_content_config = types.GenerateContentConfig(
+            temperature=1,
+            top_p=0.95,
+            top_k=40,
+            max_output_tokens=8192,
+            response_mime_type="text/plain",
+        )
+
+        max_attempts = 3
+        retry_delay_seconds = 10
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response_text = ""
+                for chunk in client.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                    config=generate_content_config,
+                ):
+                    print(chunk.text, end="")
+                    response_text += chunk.text
+                return response_text
+            except genai_errors.ServerError as e:
+                print(f"\nGemini server error (attempt {attempt}/{max_attempts}): {e}")
+                if attempt == max_attempts:
+                    raise
+                time.sleep(retry_delay_seconds)
+    finally:
+        try:
+            os.remove(temp_audio_path)
+        except OSError:
+            pass
+
+
+# ============================================================
 # REPORT UPLOAD / SAVE
 # ============================================================
 def ping_backend():
     """
-    Fires a lightweight request at the backend as soon as a session starts.
-    The backend (Render free tier) sleeps when idle and takes a while to wake
-    up on the first request, so pinging it early means it's already warm by
-    the time the session ends and the real upload happens.
+    Fires a lightweight request at the report backend and the Twi bridge as soon
+    as a session starts. Both run on Render's free tier and sleep when idle, so
+    pinging them early means they're already warm by the time the session ends
+    and the real upload/translation calls happen.
     """
     try:
         base_url = urlparse(REPORT_UPLOAD_URL)
@@ -303,6 +368,13 @@ def ping_backend():
         print("Backend ping sent.")
     except requests.exceptions.RequestException as e:
         print(f"Backend ping failed (will still attempt upload later): {e}")
+
+    try:
+        bridge_url = urlparse(TWI_BRIDGE_URL)
+        requests.get(f"{bridge_url.scheme}://{bridge_url.netloc}/health", timeout=15)
+        print("Twi bridge ping sent.")
+    except requests.exceptions.RequestException as e:
+        print(f"Twi bridge ping failed (will still attempt translation later): {e}")
 
 
 def upload_report_to_server(report_text, patient_id):
@@ -364,17 +436,17 @@ def save_report_to_word(report_text):
     print(f"\nReport saved as: {full_path}")
 
 
-def save_transcript_fallback(transcript_text):
-    """Saves the raw transcript as plain text when report generation fails, so the consultation isn't lost."""
+def save_audio_fallback(wav_bytes):
+    """Saves the raw session audio when report generation fails, so the consultation isn't lost."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"Transcript_{timestamp}.txt"
+    filename = f"Consultation_Audio_{timestamp}.wav"
     full_path = os.path.join(script_dir, filename)
 
-    with open(full_path, "w", encoding="utf-8") as f:
-        f.write(transcript_text)
+    with open(full_path, "wb") as f:
+        f.write(wav_bytes)
 
-    print(f"\nRaw transcript saved as: {full_path}")
+    print(f"\nRaw session audio saved as: {full_path}")
     return full_path
 
 
@@ -390,20 +462,22 @@ def main():
     chat_history = []
     mic_index = find_usb_microphone_index()
     button_line = setup_button()
-
-    print(f"Loading speech recognition model from {VOSK_MODEL_PATH} ...")
-    vosk_model = Model(VOSK_MODEL_PATH)
-    print("Speech recognition model loaded.")
+    language_state = {"value": "english"}
 
     trigger_queue = Queue()
     threading.Thread(target=button_watcher, args=(button_line, trigger_queue), daemon=True).start()
     threading.Thread(target=keyboard_watcher, args=(trigger_queue,), daemon=True).start()
 
     try:
-        read_text("System ready. Press the button or hit Enter to start a consultation session.")
+        read_text(
+            "System ready. Press the button or hit Enter to start a consultation session in English. "
+            "Type T then Enter to switch to Twi."
+        )
 
         while True:
-            trigger_source = wait_for_start_trigger(trigger_queue)
+            trigger_source = wait_for_start_trigger(trigger_queue, language_state)
+            session_language = language_state["value"]
+            language_state["value"] = "english"  # always reset to the default for the next session
 
             threading.Thread(target=ping_backend, daemon=True).start()
 
@@ -420,7 +494,7 @@ def main():
             result_container = {}
 
             def record_and_store():
-                result_container['text'] = speech_to_text_continuous(stop_event, mic_index, vosk_model)
+                result_container['wav_bytes'] = record_full_session(stop_event, mic_index)
 
             recording_thread = threading.Thread(target=record_and_store, daemon=True)
             recording_thread.start()
@@ -432,14 +506,18 @@ def main():
 
             read_text("Session ended. Generating report...")
 
-            consultation_text = result_container.get('text', '')
-            if consultation_text:
+            wav_bytes = result_container.get('wav_bytes')
+            if wav_bytes:
                 try:
-                    response_text = generate(consultation_text, chat_history, medical_prompt)
+                    if session_language == 'twi':
+                        english_text = transcribe_twi_to_english(wav_bytes)
+                        response_text = generate_from_text(english_text, chat_history, medical_prompt)
+                    else:
+                        response_text = generate_from_audio(wav_bytes, chat_history, medical_prompt)
                 except Exception as e:
                     print(f"\nReport generation failed: {e}")
-                    save_transcript_fallback(consultation_text)
-                    read_text("Report generation failed. The raw transcript has been saved locally.")
+                    save_audio_fallback(wav_bytes)
+                    read_text("Report generation failed. The raw session audio has been saved locally.")
                     continue
 
                 save_report_to_word(response_text)
@@ -449,7 +527,6 @@ def main():
                 else:
                     read_text("Warning: Could not upload report to server. Local copy has been saved.")
 
-                chat_history.append({"role": "user", "text": consultation_text})
                 chat_history.append({"role": "model", "text": response_text})
             else:
                 read_text("No speech was captured during the session.")

@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 
 .env
+
+# Separate standalone repo/deployment (github.com/Cascasemi/twi_bridge) - not part of this repo
+twi_bridge/
 # Speech recognition model binaries - see rockpi/README.md to download
 models/
 
