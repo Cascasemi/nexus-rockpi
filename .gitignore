@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+
+.env
+# Speech recognition model binaries - see rockpi/README.md to download
+models/
+
+# Generated consultation reports/transcripts - may contain patient data
+Consultation_Report_*.docx
+Transcript_*.txt

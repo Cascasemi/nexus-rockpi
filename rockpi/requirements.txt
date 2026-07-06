@@ -1,0 +1,9 @@
+requests
+python-dotenv
+SpeechRecognition>=3.17.0
+PyAudio>=0.2.14
+pyttsx3
+google-genai
+python-docx
+gpiod
+vosk
