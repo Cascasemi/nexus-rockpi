@@ -1,10 +1,10 @@
 import sys
 import time
 import os
+import subprocess
 import threading
 import speech_recognition as sr
 from queue import Queue, Empty
-import pyttsx3
 from vosk import Model, KaldiRecognizer, SetLogLevel
 from google import genai
 from google.genai import types, errors as genai_errors
@@ -227,20 +227,13 @@ def speech_to_text_continuous(stop_event, mic_index, vosk_model):
 
 
 def read_text(text):
-    """Text-to-speech playback."""
-    engine = pyttsx3.init()
-    voices = engine.getProperty('voices')
-
-    female_voice = None
-    for voice in voices:
-        if "female" in voice.name.lower() or "Zira" in voice.name or "Samantha" in voice.name:
-            female_voice = voice.id
-            break
-
-    engine.setProperty('voice', female_voice if female_voice else voices[0].id)
-    engine.setProperty('rate', 150)
-    engine.say(text)
-    engine.runAndWait()
+    """Text-to-speech playback via the espeak CLI (pyttsx3's espeak driver is
+    incompatible with current espeak-ng voice-list ABI on recent Debian)."""
+    print(text)
+    try:
+        subprocess.run(["espeak", "-s", "150", text], check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"TTS playback failed: {e}")
 
 
 # ============================================================
@@ -442,12 +435,11 @@ def main():
                     read_text("Report generation failed. The raw transcript has been saved locally.")
                     continue
 
-                save_report_to_word(response_text)
-
                 if upload_report_to_server(response_text, patient_id):
                     read_text("Report has been successfully uploaded to the patient's records.")
                 else:
-                    read_text("Warning: Could not upload report to server. Local copy has been saved.")
+                    save_report_to_word(response_text)
+                    read_text("Warning: Could not upload report to server. Local copy has been saved for later sync.")
 
                 chat_history.append({"role": "user", "text": consultation_text})
                 chat_history.append({"role": "model", "text": response_text})

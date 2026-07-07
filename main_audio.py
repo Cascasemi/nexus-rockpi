@@ -520,12 +520,11 @@ def main():
                     read_text("Report generation failed. The raw session audio has been saved locally.")
                     continue
 
-                save_report_to_word(response_text)
-
                 if upload_report_to_server(response_text, patient_id):
                     read_text("Report has been successfully uploaded to the patient's records.")
                 else:
-                    read_text("Warning: Could not upload report to server. Local copy has been saved.")
+                    save_report_to_word(response_text)
+                    read_text("Warning: Could not upload report to server. Local copy has been saved for later sync.")
 
                 chat_history.append({"role": "model", "text": response_text})
             else:
